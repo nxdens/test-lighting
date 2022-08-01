@@ -1,3 +1,6 @@
+- try age prediction
+
+
 ### Deep learning project seed
 Use this seed to start new deep learning / ML projects.
 
