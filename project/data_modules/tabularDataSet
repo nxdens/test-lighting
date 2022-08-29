@@ -1,0 +1,67 @@
+import logging
+import os
+import torch
+import torchvision
+import pandas as pd
+from torch.utils.data import Dataset
+from radio.settings.pathutils import is_dir_or_symlink, PathType
+from typing import Dict, Tuple, List, Optional, Union, Any
+
+
+class CerebroTabularDataset(Dataset):
+
+    df: pd.DataFrame = None
+    """dataframe that stores important features and labels
+    """
+
+    def __init__(
+        self,
+        *args,
+        dataframe: Union[pd.DataFrame, str],
+        inputs: List[str],
+        labels: List[str],
+        transforms: torchvision.transforms,
+        **Params
+    ):
+        """Function creates a pytorch dataset from a spreadsheet
+
+        placeholder
+
+        .. Todo::
+            - fix formatting
+            - add documentation
+
+        Args:
+            dataframe (Union[pd.DataFrame, str]):
+            inputs: List[str],
+            labels: List[str],
+            transforms: torchvision.transforms,
+
+        """
+        if os.path.exists(dataframe):
+            extension = os.path.splitext(dataframe)[-1]
+            if extension == ".csv":
+                self.df = pd.read_csv(dataframe)
+            elif extension == ".xlsx":
+                self.df = pd.read_excel(dataframe)
+            else:
+                raise RuntimeError("Unsupported file type. Please use csv or xlsx.")
+        else:
+            self.df = dataframe
+
+        tensor_transform = torchvision.transforms.ToTensor()
+        self.featuresTensor = tensor_transform(self.df[inputs].values)
+        self.labelsTensor = tensor_transform(self.df[labels].values)
+        self.transforms = transforms
+
+    def __len__(self):
+        return self.df.shape[0]
+
+    def __getitem__(self, index):
+        # check tensor dtype
+        # return formatted as a dict
+        data = self.featuresTensor[index, :]
+        if self.transforms:
+            data = self.transforms(data)
+        label = self.labelsTensor[index, :]
+        return {"input": data, "label": label}
