@@ -13,7 +13,7 @@ from radio.settings.pathutils import is_dir_or_symlink, PathType
 from radio.data.datatypes import SpatialShapeType
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
-from project.misc import nifti_helpers
+from ..misc import nifti_helpers
 import pandas as pd
 import numpy as np
 
@@ -24,7 +24,7 @@ OneSample = Union[Dict[str, Tuple[Any, ...]], Tuple[Any, ...]]
 # TODO: make something to compile subject ID, scan ID and target
 
 
-class DepDataModule(radata.CerebroDataModule):
+class DepDataModule(radata.BaseDataModule):
     """
     This class will be based on the folder dataset
     in radio for our specific project
@@ -35,10 +35,12 @@ class DepDataModule(radata.CerebroDataModule):
         self,
         *args,
         root: PathType,
-        subject_dicts: Union[dict[str, list[str]], dict[str, pd.DataFrame]],
         study: str = "",
         subj_dir: str = "Public/data",
         data_dir: str = "",
+        subject_dicts: Optional[
+            Union[dict[str, list[str]], dict[str, pd.DataFrame]]
+        ] = None,
         modalities: Optional[List[str]] = None,
         labels: Optional[List[str]] = None,
         train_transforms: Optional[tio.Transform] = None,
@@ -75,56 +77,40 @@ class DepDataModule(radata.CerebroDataModule):
     ) -> None:
         super().__init__(
             *args,
-            root,
-            study,
-            subj_dir,
-            data_dir,
-            modalities,
-            labels,
-            train_transforms,
-            val_transforms,
-            test_transforms,
-            use_augmentation,
-            use_preprocessing,
-            resample,
-            None,
-            probability_map,
-            create_custom_probability_map,
-            label_name,
-            label_probabilities,
-            queue_max_length,
-            samples_per_volume,
-            batch_size,
-            shuffle_subjects,
-            shuffle_patches,
-            num_workers,
-            pin_memory,
-            start_background,
-            drop_last,
-            num_folds,
-            val_split,
-            dims,
-            seed,
-            verbose,
+            root=root,
+            train_transforms=train_transforms,
+            val_transforms=val_transforms,
+            test_transforms=test_transforms,
+            batch_size=batch_size,
+            shuffle=shuffle_subjects,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+            num_folds=num_folds,
+            val_split=val_split,
+            seed=seed,
             **kwargs,
         )
         # input dict should have the same keys
+        self.scanCol = scanCol
+        self.label_col = label_col
         self.subject_list = {"train": None, "test": None, "val": None}
-        if isinstance(subject_dicts["train"], list):
-            # Subject_dataframe should contain an column indicating which fold
-            for key in self.subject_list.key():
-                self.subject_list[key] = pd.DataFrame(
-                    np.array(subject_dicts[key]), columns=["subjectFolder"]
-                )
-        else:  # dict of pd.DataFrame's
-            for key in self.subject_list.key():
-                self.subject_list[key] = subject_dicts[key]
+        if subject_dicts:
+            if isinstance(subject_dicts["train"], list):
+                # Subject_dataframe should contain an column indicating which fold
+                for key in self.subject_list.key():
+                    self.subject_list[key] = pd.DataFrame(
+                        np.array(subject_dicts[key]), columns=["subjectFolder"]
+                    )
+            else:  # dict of pd.DataFrame's
+                for key in self.subject_list.key():
+                    self.subject_list[key] = subject_dicts[key]
+        else:
+            # get subject list if needed
+            pass
 
         if base_csv:
             self.data = pd.read_csv(base_csv)
-        else:
-            self.file_tree = self.parse_root(self.root)
-            pass
 
     def prepare_data(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -133,34 +119,34 @@ class DepDataModule(radata.CerebroDataModule):
         """
         if not is_dir_or_symlink(self.root):
             raise OSError("Study data directory not found!")
-        self.check_if_data_split()
+        self.file_tree = self.parse_root(self.root)
 
-    def setup(self, *args: Any, stage: Option[str] = None, **kwargs: Any) -> None:
-        if stage is None or stage is "fit":
+    def setup(self, *args: Any, stage: Optional[str] = None, **kwargs: Any) -> None:
+        if stage == None or stage == "fit":
             train_transforms = (
                 self.default_transforms(stage="fit")
                 if self.train_transforms is None
                 else self.train_transforms
             )
-        if stage is None or stage is "val":
+        if stage == None or stage == "val":
             val_transforms = (
                 self.default_transforms(stage="fit")
                 if self.val_transforms is None
                 else self.val_transforms
             )
-        if stage is None or stage is "fit":
+        if stage == None or stage == "fit":
             train_list = self.get_subjects(fold="train")
             self.train_dataset = tio.SubjectsDataset(
                 train_list, transform=train_transforms
             )
             self.train_loader = super().dataloader(self.train_dataset)
 
-        if stage is None or stage is "fit":
+        if stage == None or stage == "fit":
             val_list = self.get_subjects(fold="val")
             self.val_dataset = tio.SubjectsDataset(val_list, transform=val_transforms)
             self.val_loader = super().dataloader(self.val_dataset)
 
-        if stage is None or stage is "fit":
+        if stage == None or stage == "fit":
             test_list = self.get_subjects(fold="test")
             self.test_dataset = tio.SubjectsDataset(test_list)
             self.test_loader = super().dataloader(self.test_dataset)
@@ -314,6 +300,51 @@ class DepDataModule(radata.CerebroDataModule):
         )
         return train_list, val_list, test_list
 
+    def dataloader(
+        self,
+        dataset: DatasetType,
+        batch_size: Optional[int] = None,
+        shuffle: Optional[bool] = None,
+        num_workers: Optional[int] = None,
+        pin_memory: Optional[bool] = None,
+        drop_last: Optional[bool] = None,
+    ) -> DataLoader:
+        """
+        Instantiate a DataLoader.
+
+        Parameters
+        ----------
+        batch_size : int, optional
+            How many samples per batch to load. Default = ``32``.
+        shuffle : bool, optional
+            Whether to shuffle the data at every epoch. Default = ``False``.
+        num_workers : int, optional
+            How many subprocesses to use for data loading. ``0`` means that the
+            data will be loaded in the main process. Default: ``0``.
+        pin_memory : bool, optional
+            If ``True``, the data loader will copy Tensors into CUDA pinned
+            memory before returning them.
+        drop_last : bool, optional
+            Set to ``True`` to drop the last incomplete batch, if the dataset
+            size is not divisible by the batch size. If ``False`` and the size
+            of dataset is not divisible by the batch size, then the last batch
+            will be smaller. Default = ``False``.
+
+        Returns
+        -------
+        _ : DataLoader
+        """
+        shuffle = shuffle if shuffle else self.shuffle
+        shuffle &= not isinstance(dataset, IterableDataset)
+        return DataLoader(
+            dataset=dataset,
+            batch_size=batch_size if batch_size else self.batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers if num_workers else self.num_workers,
+            pin_memory=pin_memory if pin_memory else self.pin_memory,
+            drop_last=drop_last if drop_last else self.drop_last,
+        )
+
     def default_preprocessing_transforms(self, **kwargs: Any) -> List[tio.Transform]:
         return None
 
@@ -353,7 +384,6 @@ class file_type(object):
 
 
 if __name__ == "__main__":
-    test_mod = DepDataModule()
+    test_mod = DepDataModule(root="/home/wangl15@acct.upmchs.net/Desktop/Raw_korean")
     test_mod.prepare_data()
     test_mod.setup()
-
