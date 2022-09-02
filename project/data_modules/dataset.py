@@ -6,6 +6,7 @@ from treelib import Node, Tree
 from pyrsistent import optional
 import torch
 import torch.utils.data
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import torchio as tio
 import monai.transforms
 import radio.data as radata
@@ -16,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 from ..misc import nifti_helpers
 import pandas as pd
 import numpy as np
+import re
+import collections
 
 
 Sample = List[Tuple[Path, Any]]
@@ -31,10 +34,14 @@ class DepDataModule(radata.BaseDataModule):
     DO NOT use this with a queue yet
     """
 
+    # CHANGE THIS FOR DIFFERENT ID PATTERNS. USED IN prepare_data()
+    ID_PATTERN = "ABD-[A-Z]+-\d\d\d\d"
+
     def __init__(
         self,
         *args,
         root: PathType,
+        base_csv: pd.DataFrame,
         study: str = "",
         subj_dir: str = "Public/data",
         data_dir: str = "",
@@ -68,10 +75,6 @@ class DepDataModule(radata.BaseDataModule):
         dims: Tuple[int, int, int] = (256, 256, 256),
         seed: int = 41,
         verbose: bool = False,
-        base_csv: pd.DataFrame = None,
-        subjectCol: Optional[str] = None,
-        scanCol: Optional[str] = None,
-        label_col: Optional[list[str]] = None,
         transform: Optional[Callable] = None,
         **kwargs,
     ) -> None:
@@ -92,10 +95,11 @@ class DepDataModule(radata.BaseDataModule):
             **kwargs,
         )
         # input dict should have the same keys
-        self.scanCol = scanCol
-        self.label_col = label_col
-        self.subject_list = {"train": None, "test": None, "val": None}
+        self.data = pd.read_csv(base_csv)
+
+        self.subject_list = None
         if subject_dicts:
+            self.subject_list = {"train": None, "test": None, "val": None}
             if isinstance(subject_dicts["train"], list):
                 # Subject_dataframe should contain an column indicating which fold
                 for key in self.subject_list.key():
@@ -105,12 +109,6 @@ class DepDataModule(radata.BaseDataModule):
             else:  # dict of pd.DataFrame's
                 for key in self.subject_list.key():
                     self.subject_list[key] = subject_dicts[key]
-        else:
-            # get subject list if needed
-            pass
-
-        if base_csv:
-            self.data = pd.read_csv(base_csv)
 
     def prepare_data(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -119,7 +117,13 @@ class DepDataModule(radata.BaseDataModule):
         """
         if not is_dir_or_symlink(self.root):
             raise OSError("Study data directory not found!")
-        self.file_tree = self.parse_root(self.root)
+        self.parse_root(self.root)
+        self.match_ID_col()
+        # self.depth = self.find_tree_depth()
+        # print("depth", self.depth)
+        self.find_images()
+        self.check_splits()
+        # make dataframe somehow
 
     def setup(self, *args: Any, stage: Optional[str] = None, **kwargs: Any) -> None:
         if stage == None or stage == "fit":
@@ -139,17 +143,101 @@ class DepDataModule(radata.BaseDataModule):
             self.train_dataset = tio.SubjectsDataset(
                 train_list, transform=train_transforms
             )
-            self.train_loader = super().dataloader(self.train_dataset)
+            self.train_loader = self.dataloader(self.train_dataset)
 
         if stage == None or stage == "fit":
             val_list = self.get_subjects(fold="val")
             self.val_dataset = tio.SubjectsDataset(val_list, transform=val_transforms)
-            self.val_loader = super().dataloader(self.val_dataset)
+            self.val_loader = self.dataloader(self.val_dataset)
 
         if stage == None or stage == "fit":
             test_list = self.get_subjects(fold="test")
             self.test_dataset = tio.SubjectsDataset(test_list)
-            self.test_loader = super().dataloader(self.test_dataset)
+            self.test_loader = self.dataloader(self.test_dataset)
+
+    def match_ID_col(self):
+        # find column names with 'id' followed by not a letter
+        id_cols = [
+            col
+            for col in self.data.columns.values
+            if re.search("id^[a-z]|id$", col.lower())
+        ]
+        self.id_col = []  # length 1 string array
+        for col in id_cols:
+            if re.search(self.ID_PATTERN, str(self.data[col].values[2])):
+                self.id_col = str(col)
+                break
+        # none found need to manually find data
+
+    def find_tree_depth(self) -> int:
+        # returns true if id pattern matches a file(?)
+        depth = 1
+        start = self.file_tree.get_node(str(self.root))
+        depth = self._breath_first_id_search(self.file_tree, start, self.ID_PATTERN)
+        return depth
+
+    @staticmethod
+    def _breath_first_id_search(tree, root, pattern) -> int:
+        q = collections.deque()
+        q.append(root)
+        depth = 1
+
+        def _check_node(node, pattern) -> bool:
+            return str(node.data.file_typ) == "image" and re.search(pattern, node.tag)
+
+        while len(q) > 0:
+            node = q.popleft()
+            if _check_node(node, pattern):
+                split = node.identifier.split("/")
+                for i, dirname in enumerate(split):
+                    if dirname == root.tag:
+                        return len(split) - i
+            for child in node.fpointer:
+                q.append(tree.get_node(str(child)))
+        return -1
+
+    def find_images(self):
+        self.subjects_files_dict = {}
+        for item in self.data[self.id_col]:
+            self.subjects_files_dict[str(item)] = []
+        for node in self.file_tree.all_nodes_itr():
+            match = re.search(self.ID_PATTERN, node.tag)
+            if match and node.data.file_typ == "image":
+                try:
+                    self.subjects_files_dict[match.group()].append(node)
+                except:
+                    pass
+
+    def check_splits(self, subsets: Tuple[float, float, float] = (0.8, 0.1, 0.1)):
+
+        if not self.subject_list:
+            self.subject_list = {"train": None, "test": None, "val": None}
+            ids = np.array(list(set(self.data[str(self.id_col)].values)))
+            np.random.shuffle(ids)
+            first_split = int(ids.shape[0] * subsets[0])
+            second_split = int(ids.shape[0] * (subsets[0] + subsets[1]))
+
+            ids_dict = {
+                "train": ids[0:first_split],
+                "val": ids[first_split:second_split],
+                "test": ids[second_split:],
+            }
+            for key in ["train", "test", "val"]:
+                self.subject_list[key] = pd.DataFrame(
+                    ids_dict[key], columns=[self.id_col]
+                )
+
+    def teardown(self):
+        pass
+
+    def train_dataloader(self):
+        return self.train_loader
+
+    def val_dataloader(self):
+        return self.val_loader
+
+    def test_dataloader(self):
+        return self.test_loader
 
     @staticmethod
     def tio_subjects_to_dataframe(
@@ -194,7 +282,6 @@ class DepDataModule(radata.BaseDataModule):
                     sub_names.append(name)
 
         combined_sub_scan = np.array(temp)
-        print(combined_sub_scan[:, 0])
         return pd.DataFrame(
             {
                 "subjectFolder": combined_sub_scan[:, 0],
@@ -226,8 +313,7 @@ class DepDataModule(radata.BaseDataModule):
             }
         )
 
-    @staticmethod
-    def parse_root(root) -> Tree:
+    def parse_root(self, root_dir):
         """parses the folder structure of the root path given. designed for ABD raw folder.
 
         Args:
@@ -236,14 +322,16 @@ class DepDataModule(radata.BaseDataModule):
         Returns:
             Tree: tree of files and folders in the root folder
         """
-        file_tree = Tree()
+        self.file_tree = Tree()
         ignore_files = [".DS_Store"]
-        file_tree.create_node(
-            os.path.dirname(root), root, data=file_type("directory", root),
+        self.file_tree.create_node(
+            os.path.basename(root_dir),
+            str(root_dir),
+            data=file_type("directory", root_dir),
         )
-        for root, dirs, files in os.walk(root):
+        for root, dirs, files in os.walk(root_dir):
             for name in dirs:
-                file_tree.create_node(
+                self.file_tree.create_node(
                     name,
                     os.path.join(root, name),
                     parent=root,
@@ -251,42 +339,43 @@ class DepDataModule(radata.BaseDataModule):
                 )
             for name in files:
                 if not name in ignore_files:
-                    file_tree.create_node(
+                    self.file_tree.create_node(
                         name,
                         os.path.join(root, name),
                         parent=root,
                         data=file_type("file", os.path.join(root, name)),
                     )
-
-        return file_tree
+        return self.file_tree
 
     def get_subjects(self, fold: str = "train") -> List[tio.Subject]:
-        train_subjs, test_subjs, val_subjs = self.get_subjects_dicts(
-            input=self.inputs, labels=self.labels
-        )
+        train_subjs, test_subjs, val_subjs = self.get_subjects_lists()
         if fold == "train":
-            subjs_dict = train_subjs
+            subs = train_subjs
         elif fold == "test":
-            subjs_dict = test_subjs
+            subs = test_subjs
         else:
-            subjs_dict = val_subjs
+            subs = val_subjs
 
-    def get_subjects_lists(self, input, labels) -> List[tio.Subject]:
+        return subs
+
+    def get_subjects_lists(self) -> List[tio.Subject]:
         def _get_subjects_list(
             data: pd.DataFrame, subject_list: pd.DataFrame
         ) -> Tuple[List[tio.Subject], List[tio.Subject], List[tio.Subject]]:
             # Need to drop na values somewhere before this
-            subset = data[data["subjectFolder"].isin(subject_list["subjectFolder"])]
-            data_input = subset[input].values
-            data_labels = subset[labels].values
+            if subject_list is not None:
+                subset = data[data[self.id_col].isin(subject_list[self.id_col])]
+            else:
+                subset = data
             dummy_image = tio.ScalarImage(tensor=torch.rand(1, 128, 128, 128))
             subjects = []
-            for sub in zip(data_input, data_labels):
-                subjects.append(
-                    tio.Subject(
-                        {"dummy": dummy_image, "input": sub[0], "labels": sub[1]}
-                    )
-                )
+            for sub in subset.iterrows():
+                sub_dict = {"dummy": dummy_image}
+                image_path = self.subjects_files_dict[sub[1][self.id_col]][0].data.path
+                modality = re.search(".*(?=\.)", str(image_path)).group().split("_")[-1]
+                sub_dict[modality] = tio.ScalarImage(image_path)
+                sub_dict = dict(sub_dict, **(sub[1].to_dict()))
+                subjects.append(tio.Subject(sub_dict))
             return subjects
 
         train_list = _get_subjects_list(
@@ -302,7 +391,7 @@ class DepDataModule(radata.BaseDataModule):
 
     def dataloader(
         self,
-        dataset: DatasetType,
+        dataset: torch.utils.data.dataloader,
         batch_size: Optional[int] = None,
         shuffle: Optional[bool] = None,
         num_workers: Optional[int] = None,
@@ -345,6 +434,9 @@ class DepDataModule(radata.BaseDataModule):
             drop_last=drop_last if drop_last else self.drop_last,
         )
 
+    def default_transforms(self, stage="fit"):
+        return None
+
     def default_preprocessing_transforms(self, **kwargs: Any) -> List[tio.Transform]:
         return None
 
@@ -384,6 +476,10 @@ class file_type(object):
 
 
 if __name__ == "__main__":
-    test_mod = DepDataModule(root="/home/wangl15@acct.upmchs.net/Desktop/Raw_korean")
+    test_mod = DepDataModule(
+        root="/home/wangl15@acct.upmchs.net/Desktop/Raw_korean",
+        base_csv="/home/antonija/Desktop/circuits/scripts/cnn_depression_linghai/data/data_Dec_8_2021.csv",
+    )
     test_mod.prepare_data()
     test_mod.setup()
+    print(test_mod.train_dataset[0])
